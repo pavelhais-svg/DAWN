@@ -97,6 +97,7 @@ struct probe_metric_s {
     int max_chan_util_val[__DAWN_BAND_MAX]; // eval_probe_metric()()
     int rssi_weight[__DAWN_BAND_MAX]; // eval_probe_metric()()
     int rssi_center[__DAWN_BAND_MAX]; // eval_probe_metric()()
+    int beacon_request_rssi_max[__DAWN_BAND_MAX]; // send_beacon_requests(): skip soliciting BEACON reports from clients at or above this RSSI (0 = always solicit)
     struct mac_entry_s* neighbors[__DAWN_BAND_MAX]; // ap_get_nr()
 };
 

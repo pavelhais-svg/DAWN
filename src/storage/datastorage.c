@@ -20,6 +20,8 @@ static client* client_array_get_client_for_bssid(struct dawn_mac bssid_mac, stru
 
 static int compare_station_count(ap* ap_entry_own, ap* ap_entry_to_compare, struct dawn_mac client_addr);
 
+static int probe_effective_signal(const struct probe_entry_s *p);
+
 
 // ---------------- Global variables ----------------
 // config section name
@@ -169,6 +171,8 @@ void send_beacon_requests(ap* target_ap, ap* host_ap, int sub_id) {
 
     time_t now = time(0);
     time_t fresh_window = timeout_config.update_beacon_reports;
+    int serving_band = get_band(host_ap->freq);
+    int happy_rssi = dawn_metric.beacon_request_rssi_max[serving_band];
 
     // Go through clients to request BEACON
     while (i != NULL && mac_is_equal_bb(i->bssid_addr, host_ap->bssid_addr)) {
@@ -182,25 +186,48 @@ void send_beacon_requests(ap* target_ap, ap* host_ap, int sub_id) {
         // Bitwise AND to check for overlap in RRM capabilities
         if (i->rrm_enabled_capa & dawn_metric.rrm_mode_mask)
         {
-            // Skip the request when we already hold a fresh client-side RCPI for this
-            // (client, target BSS): a measurement that arrived within one refresh cycle
-            // (autonomously or from a prior request) carries no new information, so
-            // re-asking only adds airtime and ubus load. Lock order is ap -> client ->
-            // probe (the caller already holds ap and client); probe is released before the
-            // blocking ubus_invoke. The only other thread, the multicast sniffer, never
-            // nests locks, so this acquisition cannot deadlock.
-            bool fresh = false;
-            if (fresh_window > 0) {
+            // Two reasons to suppress a request, both decided from data we already hold:
+            //   "comfortable" - the client's current RSSI on its serving AP is at or
+            //       above beacon_request_rssi_max: it is well connected, so there is no
+            //       roaming decision to inform and no reason to make it scan. Disabled
+            //       (and behaviour unchanged) when the threshold is 0.
+            //   "fresh"       - we already hold a client-side RCPI for this target BSS
+            //       that was refreshed within one update_beacon_reports cycle, so the
+            //       reply would carry no new information.
+            // Lock order is ap -> client -> probe (the caller already holds ap and
+            // client); probe is released before the blocking ubus_invoke. The only other
+            // thread, the multicast sniffer, never nests locks, so this cannot deadlock.
+            bool skip = false;
+            const char* skip_reason = "";
+
+            if (happy_rssi != 0 || fresh_window > 0) {
                 dawn_mutex_lock(&probe_array_mutex);
-                probe_entry* pe = probe_array_get_entry(i->client_addr, target_ap->bssid_addr);
-                if (pe && pe->rcpi <= 220 && pe->rcpi_timestamp >= now - fresh_window)
-                    fresh = true;
+
+                if (happy_rssi != 0) {
+                    probe_entry* serving = probe_array_get_entry(i->client_addr, host_ap->bssid_addr);
+                    if (serving) {
+                        int sig = probe_effective_signal(serving);
+                        if (sig != 0 && sig >= happy_rssi) {
+                            skip = true;
+                            skip_reason = "comfortable RSSI";
+                        }
+                    }
+                }
+
+                if (!skip && fresh_window > 0) {
+                    probe_entry* pe = probe_array_get_entry(i->client_addr, target_ap->bssid_addr);
+                    if (pe && pe->rcpi <= 220 && pe->rcpi_timestamp >= now - fresh_window) {
+                        skip = true;
+                        skip_reason = "fresh RCPI";
+                    }
+                }
+
                 dawn_mutex_unlock(&probe_array_mutex);
             }
 
-            if (fresh) {
-                dawnlog_debug("Client " MACSTR " / target " MACSTR ": fresh RCPI within %lds, skipping BEACON REQUEST\n",
-                    MAC2STR(i->client_addr.u8), MAC2STR(target_ap->bssid_addr.u8), (long)fresh_window);
+            if (skip) {
+                dawnlog_debug("Client " MACSTR " / target " MACSTR ": skipping BEACON REQUEST (%s)\n",
+                    MAC2STR(i->client_addr.u8), MAC2STR(target_ap->bssid_addr.u8), skip_reason);
             } else {
                 int ubus_status = ubus_send_beacon_request(i, target_ap, dawn_metric.duration, sub_id);
                 if (ubus_status)

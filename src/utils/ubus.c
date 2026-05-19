@@ -1909,6 +1909,7 @@ int uci_send_via_network()
         blobmsg_add_u32(&b, "max_chan_util_val", dawn_metric.max_chan_util_val[band]);
         blobmsg_add_u32(&b, "rssi_weight", dawn_metric.rssi_weight[band]);
         blobmsg_add_u32(&b, "rssi_center", dawn_metric.rssi_center[band]);
+        blobmsg_add_u32(&b, "beacon_request_rssi_max", dawn_metric.beacon_request_rssi_max[band]);
         blobmsg_close_table(&b, band_entry);
     }
     blobmsg_close_table(&b, band_table);
