@@ -629,8 +629,8 @@ static int handle_beacon_rep(struct blob_attr *msg) {
             // These fields, can't be set from a BEACON REPORT, so we ignore them later if updating an existing PROBE
             // TODO: See if hostapd can send optional elements which might allow these to be set
             entry->signal = 0;
-            entry->ht_capabilities = false; // that is very problematic!!!
-            entry->vht_capabilities = false; // that is very problematic!!!
+            entry->ht_capabilities = false;
+            entry->vht_capabilities = false;
 
             // FIXME: Why is this?  To allow a 802.11k client to meet proe count check immediately?
             entry->counter = dawn_metric.min_probe_count;
@@ -641,14 +641,19 @@ static int handle_beacon_rep(struct blob_attr *msg) {
             dawn_mutex_require(&probe_array_mutex);
             probe_entry* entry_updated = insert_to_probe_array(entry, true, true, time(0));
 
+            int rcpi_dbm = rcpi_to_rssi(entry->rcpi);
             if (entry_updated != entry)
             {
-                dawnlog_info("Local BEACON used to update RCPI and RSNI for client / BSSID = " MACSTR " / " MACSTR " \n", MAC2STR(entry->client_addr.u8), MAC2STR(entry->bssid_addr.u8));
+                dawnlog_info("BEACON report (update) client=" MACSTR " bssid=" MACSTR " rcpi=%u (~%d dBm) rsni=%u\n",
+                             MAC2STR(entry->client_addr.u8), MAC2STR(entry->bssid_addr.u8),
+                             entry->rcpi, rcpi_dbm, entry->rsni);
                 dawn_free(entry);
             }
             else
             {
-                dawnlog_info("Local BEACON is for new client / BSSID = " MACSTR " / " MACSTR " \n", MAC2STR(entry->client_addr.u8), MAC2STR(entry->bssid_addr.u8));
+                dawnlog_info("BEACON report (new) client=" MACSTR " bssid=" MACSTR " rcpi=%u (~%d dBm) rsni=%u\n",
+                             MAC2STR(entry->client_addr.u8), MAC2STR(entry->bssid_addr.u8),
+                             entry->rcpi, rcpi_dbm, entry->rsni);
 
                 dawn_mutex_require(&probe_array_mutex);
             }

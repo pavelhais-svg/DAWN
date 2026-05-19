@@ -8,9 +8,16 @@ double iee80211_calculate_expected_throughput_mbit(int exp_thr) {
     return (((double) exp_thr) / 1000);
 }
 
-// FIXME: This calculation seems to be unreliable.  Is it device specific?
+/* IEEE 802.11-2020 §9.4.2.21.7: RCPI is encoded as (2*dBm + 220) in the range
+ * 0..220 (0.5 dB steps). Values outside that range are reserved/invalid in the
+ * standard, and callers in this code base also use (uint32_t)-1 / 0xFFFFFFFF as
+ * an "absent" sentinel which arrives here as a negative int. Return 0 (matches
+ * the "no measurement" sentinel used by probe_entry->signal) in those cases so
+ * scoring paths can uniformly treat 0 as "skip". */
 int rcpi_to_rssi(int rcpi)
 {
+    if (rcpi < 0 || rcpi > 220)
+        return 0;
     return rcpi / 2 - 110;
 }
 

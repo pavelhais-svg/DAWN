@@ -203,24 +203,49 @@ int get_band(int freq) {
     return band;
 }
 
+/* Pick the best available per-(client, BSS) signal estimate, in dBm.
+ * Sources:
+ *   - probe_entry->signal : AP-side RSSI from probe / iwinfo (uint32_t-stored dBm).
+ *   - probe_entry->rcpi   : Client-side RCPI from 802.11k Beacon Report.
+ * When both are present, prefer the freshest by timestamp — the client view is
+ * authoritative for roaming decisions when current, because it reflects what
+ * the station actually hears from the target BSS, not just the asymmetric AP-side
+ * reception. Returns 0 (the historical sentinel) when no usable measurement is
+ * available, so existing call sites that skip on signal == 0 keep working. */
+static int probe_effective_signal(const struct probe_entry_s *p) {
+    int has_rssi = (p->signal != 0);
+    int has_rcpi = (p->rcpi <= 220);
+
+    if (has_rssi && has_rcpi)
+        return (p->rcpi_timestamp >= p->rssi_timestamp)
+                   ? rcpi_to_rssi(p->rcpi)
+                   : (int)p->signal;
+    if (has_rcpi)
+        return rcpi_to_rssi(p->rcpi);
+    if (has_rssi)
+        return (int)p->signal;
+    return 0;
+}
+
 // TODO: Can metric be cached once calculated? Add score_fresh indicator and reset when signal changes
 // TODO: as rest of values look to be static fr any given entry.
 int eval_probe_metric(struct probe_entry_s* probe_entry, ap* ap_entry) {
     dawnlog_debug_func("Entering...");
     int score = 0;
 
-    if (probe_entry->signal != 0)
+    int signal_dbm = probe_effective_signal(probe_entry);
+
+    if (signal_dbm != 0)
     {
         dawn_mutex_require(&ap_array_mutex);
         dawn_mutex_require(&probe_array_mutex);
 
-        // TODO: Should RCPI be used here as well?
         int band = get_band(probe_entry->freq);
         score = dawn_metric.initial_score[band];
 
-        score += probe_entry->signal >= dawn_metric.rssi_val[band] ? dawn_metric.rssi[band] : 0;
-        score += probe_entry->signal <= dawn_metric.low_rssi_val[band] ? dawn_metric.low_rssi[band] : 0;
-        score += (probe_entry->signal - dawn_metric.rssi_center[band]) * dawn_metric.rssi_weight[band];
+        score += signal_dbm >= dawn_metric.rssi_val[band] ? dawn_metric.rssi[band] : 0;
+        score += signal_dbm <= dawn_metric.low_rssi_val[band] ? dawn_metric.low_rssi[band] : 0;
+        score += (signal_dbm - dawn_metric.rssi_center[band]) * dawn_metric.rssi_weight[band];
 
         // check if ap entry is available
         if (ap_entry != NULL) {
@@ -523,8 +548,9 @@ int kick_clients(struct dawn_mac bssid_mac, uint32_t id) {
            
             if ((kick_type == 0) && own_probe && (dawn_metric.kicking & 2) == 2) {
                 int band = get_band(own_probe->freq);
+                int own_signal = probe_effective_signal(own_probe);
 
-                if (own_probe->signal < dawn_metric.rssi_center[band])
+                if (own_signal != 0 && own_signal < dawn_metric.rssi_center[band])
                 {
                     dawnlog_info("Client " MACSTR ": Low asolute RSSI - proposing other APs\n", MAC2STR(j->client_addr.u8));
                     dawn_mutex_require(&ap_array_mutex);
