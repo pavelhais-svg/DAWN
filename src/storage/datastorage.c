@@ -167,6 +167,9 @@ void send_beacon_requests(ap* target_ap, ap* host_ap, int sub_id) {
     // Seach for BSSID
     client* i = *client_find_first_bc_entry(host_ap->bssid_addr, dawn_mac_null, false);
 
+    time_t now = time(0);
+    time_t fresh_window = timeout_config.update_beacon_reports;
+
     // Go through clients to request BEACON
     while (i != NULL && mac_is_equal_bb(i->bssid_addr, host_ap->bssid_addr)) {
         if (dawnlog_showing(DAWNLOG_DEBUG))
@@ -179,10 +182,31 @@ void send_beacon_requests(ap* target_ap, ap* host_ap, int sub_id) {
         // Bitwise AND to check for overlap in RRM capabilities
         if (i->rrm_enabled_capa & dawn_metric.rrm_mode_mask)
         {
-            int ubus_status = ubus_send_beacon_request(i, target_ap, dawn_metric.duration, sub_id);
-            if (ubus_status)
-                dawnlog_warning("Client / BSSID = " MACSTR " / " MACSTR ": BEACON REQUEST failed",
-                    MAC2STR(i->client_addr.u8), MAC2STR(target_ap->bssid_addr.u8));
+            // Skip the request when we already hold a fresh client-side RCPI for this
+            // (client, target BSS): a measurement that arrived within one refresh cycle
+            // (autonomously or from a prior request) carries no new information, so
+            // re-asking only adds airtime and ubus load. Lock order is ap -> client ->
+            // probe (the caller already holds ap and client); probe is released before the
+            // blocking ubus_invoke. The only other thread, the multicast sniffer, never
+            // nests locks, so this acquisition cannot deadlock.
+            bool fresh = false;
+            if (fresh_window > 0) {
+                dawn_mutex_lock(&probe_array_mutex);
+                probe_entry* pe = probe_array_get_entry(i->client_addr, target_ap->bssid_addr);
+                if (pe && pe->rcpi <= 220 && pe->rcpi_timestamp >= now - fresh_window)
+                    fresh = true;
+                dawn_mutex_unlock(&probe_array_mutex);
+            }
+
+            if (fresh) {
+                dawnlog_debug("Client " MACSTR " / target " MACSTR ": fresh RCPI within %lds, skipping BEACON REQUEST\n",
+                    MAC2STR(i->client_addr.u8), MAC2STR(target_ap->bssid_addr.u8), (long)fresh_window);
+            } else {
+                int ubus_status = ubus_send_beacon_request(i, target_ap, dawn_metric.duration, sub_id);
+                if (ubus_status)
+                    dawnlog_warning("Client / BSSID = " MACSTR " / " MACSTR ": BEACON REQUEST failed",
+                        MAC2STR(i->client_addr.u8), MAC2STR(target_ap->bssid_addr.u8));
+            }
         }
 
         i = i->next_entry_bc;
