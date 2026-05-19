@@ -93,14 +93,17 @@ static void client_to_server_close(struct ustream *s) {
 }
 
 static void client_to_server_state(struct ustream *s) {
-    struct client *cl = container_of(s, struct client, s.stream);
+    struct network_con_s *con = container_of(s, struct network_con_s, stream.stream);
 
     dawnlog_debug_func("Entering...");
 
     if (!s->write_error && !s->eof)
         return;
 
-    dawnlog_error("Closing connection, pending: %d, total: %d\n", s->w.data_bytes, cl->ctr);
+    dawnlog_error("Closing outbound connection to %s:%u, pending: %d\n",
+                  inet_ntoa(con->sock_addr.sin_addr),
+                  ntohs(con->sock_addr.sin_port),
+                  s->w.data_bytes);
     client_to_server_close(s);
 }
 
@@ -341,13 +344,24 @@ int add_tcp_connection(char *ipv4, int port) {
 
     dawnlog_debug_func("Entering...");
 
+    if (ipv4 == NULL || port <= 0 || port > 65535) {
+        dawnlog_warning("add_tcp_connection: invalid peer %s:%d, skipping\n",
+                        ipv4 ? ipv4 : "(null)", port);
+        return -1;
+    }
+
     char port_str[12];
-    sprintf(port_str, "%d", port); // TODO: Manage buffer length
+    snprintf(port_str, sizeof(port_str), "%d", port);
 
     memset(&serv_addr, 0, sizeof(serv_addr));
     serv_addr.sin_family = AF_INET;
     serv_addr.sin_addr.s_addr = inet_addr(ipv4);
     serv_addr.sin_port = htons(port);
+
+    if (serv_addr.sin_addr.s_addr == INADDR_NONE) {
+        dawnlog_warning("add_tcp_connection: invalid ipv4 '%s', skipping\n", ipv4);
+        return -1;
+    }
 
     struct network_con_s *tmp = tcp_list_contains_address(serv_addr);
     if (tmp != NULL) {
@@ -530,7 +544,8 @@ struct network_con_s* tcp_list_contains_address(struct sockaddr_in entry) {
 
     list_for_each_entry(con, &tcp_sock_list, list)
     {
-        if(entry.sin_addr.s_addr == con->sock_addr.sin_addr.s_addr)
+        if (entry.sin_addr.s_addr == con->sock_addr.sin_addr.s_addr &&
+            entry.sin_port == con->sock_addr.sin_port)
         {
             return con;
         }

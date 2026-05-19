@@ -1347,7 +1347,7 @@ static void ubus_umdns_cb(struct ubus_request *req, int type, struct blob_attr *
     if (!msg)
         return;
 
-    blobmsg_parse(dawn_umdns_table_policy, __DAWN_UMDNS_MAX, tb, blob_data(msg), blob_len(msg));
+    blobmsg_parse(dawn_umdns_table_policy, __DAWN_UMDNS_TABLE_MAX, tb, blob_data(msg), blob_len(msg));
 
     if (!tb[DAWN_UMDNS_TABLE]) {
         return;
@@ -1366,12 +1366,14 @@ static void ubus_umdns_cb(struct ubus_request *req, int type, struct blob_attr *
         struct blob_attr *tb_dawn[__DAWN_UMDNS_MAX];
         blobmsg_parse(dawn_umdns_policy, __DAWN_UMDNS_MAX, tb_dawn, blobmsg_data(attr), blobmsg_len(attr));
 
-        if (tb_dawn[DAWN_UMDNS_IPV4] && tb_dawn[DAWN_UMDNS_PORT]) {
-            dawnlog_debug("IPV4: %s\n", blobmsg_get_string(tb_dawn[DAWN_UMDNS_IPV4]));
-            dawnlog_debug("Port: %d\n", blobmsg_get_u32(tb_dawn[DAWN_UMDNS_PORT]));
-        } else {
-            return; // TODO: We're in a loop. Should this be return or continue?
+        if (!tb_dawn[DAWN_UMDNS_IPV4] || !tb_dawn[DAWN_UMDNS_PORT]) {
+            dawnlog_warning("umdns: peer entry missing ipv4 or port, skipping\n");
+            continue;
         }
+
+        dawnlog_debug("IPV4: %s\n", blobmsg_get_string(tb_dawn[DAWN_UMDNS_IPV4]));
+        dawnlog_debug("Port: %d\n", blobmsg_get_u32(tb_dawn[DAWN_UMDNS_PORT]));
+
         add_tcp_connection(blobmsg_get_string(tb_dawn[DAWN_UMDNS_IPV4]), blobmsg_get_u32(tb_dawn[DAWN_UMDNS_PORT]));
     }
 }
