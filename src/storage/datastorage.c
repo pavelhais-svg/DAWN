@@ -20,6 +20,8 @@ static client* client_array_get_client_for_bssid(struct dawn_mac bssid_mac, stru
 
 static int compare_station_count(ap* ap_entry_own, ap* ap_entry_to_compare, struct dawn_mac client_addr);
 
+static int probe_effective_signal(const struct probe_entry_s *p);
+
 
 // ---------------- Global variables ----------------
 // config section name
@@ -167,6 +169,11 @@ void send_beacon_requests(ap* target_ap, ap* host_ap, int sub_id) {
     // Seach for BSSID
     client* i = *client_find_first_bc_entry(host_ap->bssid_addr, dawn_mac_null, false);
 
+    time_t now = time(0);
+    time_t fresh_window = timeout_config.update_beacon_reports;
+    int serving_band = get_band(host_ap->freq);
+    int happy_rssi = dawn_metric.beacon_request_rssi_max[serving_band];
+
     // Go through clients to request BEACON
     while (i != NULL && mac_is_equal_bb(i->bssid_addr, host_ap->bssid_addr)) {
         if (dawnlog_showing(DAWNLOG_DEBUG))
@@ -179,10 +186,54 @@ void send_beacon_requests(ap* target_ap, ap* host_ap, int sub_id) {
         // Bitwise AND to check for overlap in RRM capabilities
         if (i->rrm_enabled_capa & dawn_metric.rrm_mode_mask)
         {
-            int ubus_status = ubus_send_beacon_request(i, target_ap, dawn_metric.duration, sub_id);
-            if (ubus_status)
-                dawnlog_warning("Client / BSSID = " MACSTR " / " MACSTR ": BEACON REQUEST failed",
-                    MAC2STR(i->client_addr.u8), MAC2STR(target_ap->bssid_addr.u8));
+            // Two reasons to suppress a request, both decided from data we already hold:
+            //   "comfortable" - the client's current RSSI on its serving AP is at or
+            //       above beacon_request_rssi_max: it is well connected, so there is no
+            //       roaming decision to inform and no reason to make it scan. Disabled
+            //       (and behaviour unchanged) when the threshold is 0.
+            //   "fresh"       - we already hold a client-side RCPI for this target BSS
+            //       that was refreshed within one update_beacon_reports cycle, so the
+            //       reply would carry no new information.
+            // Lock order is ap -> client -> probe (the caller already holds ap and
+            // client); probe is released before the blocking ubus_invoke. The only other
+            // thread, the multicast sniffer, never nests locks, so this cannot deadlock.
+            bool skip = false;
+            const char* skip_reason = "";
+
+            if (happy_rssi != 0 || fresh_window > 0) {
+                dawn_mutex_lock(&probe_array_mutex);
+
+                if (happy_rssi != 0) {
+                    probe_entry* serving = probe_array_get_entry(i->client_addr, host_ap->bssid_addr);
+                    if (serving) {
+                        int sig = probe_effective_signal(serving);
+                        if (sig != 0 && sig >= happy_rssi) {
+                            skip = true;
+                            skip_reason = "comfortable RSSI";
+                        }
+                    }
+                }
+
+                if (!skip && fresh_window > 0) {
+                    probe_entry* pe = probe_array_get_entry(i->client_addr, target_ap->bssid_addr);
+                    if (pe && pe->rcpi <= 220 && pe->rcpi_timestamp >= now - fresh_window) {
+                        skip = true;
+                        skip_reason = "fresh RCPI";
+                    }
+                }
+
+                dawn_mutex_unlock(&probe_array_mutex);
+            }
+
+            if (skip) {
+                dawnlog_debug("Client " MACSTR " / target " MACSTR ": skipping BEACON REQUEST (%s)\n",
+                    MAC2STR(i->client_addr.u8), MAC2STR(target_ap->bssid_addr.u8), skip_reason);
+            } else {
+                int ubus_status = ubus_send_beacon_request(i, target_ap, dawn_metric.duration, sub_id);
+                if (ubus_status)
+                    dawnlog_warning("Client / BSSID = " MACSTR " / " MACSTR ": BEACON REQUEST failed",
+                        MAC2STR(i->client_addr.u8), MAC2STR(target_ap->bssid_addr.u8));
+            }
         }
 
         i = i->next_entry_bc;
@@ -203,24 +254,49 @@ int get_band(int freq) {
     return band;
 }
 
+/* Pick the best available per-(client, BSS) signal estimate, in dBm.
+ * Sources:
+ *   - probe_entry->signal : AP-side RSSI from probe / iwinfo (uint32_t-stored dBm).
+ *   - probe_entry->rcpi   : Client-side RCPI from 802.11k Beacon Report.
+ * When both are present, prefer the freshest by timestamp — the client view is
+ * authoritative for roaming decisions when current, because it reflects what
+ * the station actually hears from the target BSS, not just the asymmetric AP-side
+ * reception. Returns 0 (the historical sentinel) when no usable measurement is
+ * available, so existing call sites that skip on signal == 0 keep working. */
+static int probe_effective_signal(const struct probe_entry_s *p) {
+    int has_rssi = (p->signal != 0);
+    int has_rcpi = (p->rcpi <= 220);
+
+    if (has_rssi && has_rcpi)
+        return (p->rcpi_timestamp >= p->rssi_timestamp)
+                   ? rcpi_to_rssi(p->rcpi)
+                   : (int)p->signal;
+    if (has_rcpi)
+        return rcpi_to_rssi(p->rcpi);
+    if (has_rssi)
+        return (int)p->signal;
+    return 0;
+}
+
 // TODO: Can metric be cached once calculated? Add score_fresh indicator and reset when signal changes
 // TODO: as rest of values look to be static fr any given entry.
 int eval_probe_metric(struct probe_entry_s* probe_entry, ap* ap_entry) {
     dawnlog_debug_func("Entering...");
     int score = 0;
 
-    if (probe_entry->signal != 0)
+    int signal_dbm = probe_effective_signal(probe_entry);
+
+    if (signal_dbm != 0)
     {
         dawn_mutex_require(&ap_array_mutex);
         dawn_mutex_require(&probe_array_mutex);
 
-        // TODO: Should RCPI be used here as well?
         int band = get_band(probe_entry->freq);
         score = dawn_metric.initial_score[band];
 
-        score += probe_entry->signal >= dawn_metric.rssi_val[band] ? dawn_metric.rssi[band] : 0;
-        score += probe_entry->signal <= dawn_metric.low_rssi_val[band] ? dawn_metric.low_rssi[band] : 0;
-        score += (probe_entry->signal - dawn_metric.rssi_center[band]) * dawn_metric.rssi_weight[band];
+        score += signal_dbm >= dawn_metric.rssi_val[band] ? dawn_metric.rssi[band] : 0;
+        score += signal_dbm <= dawn_metric.low_rssi_val[band] ? dawn_metric.low_rssi[band] : 0;
+        score += (signal_dbm - dawn_metric.rssi_center[band]) * dawn_metric.rssi_weight[band];
 
         // check if ap entry is available
         if (ap_entry != NULL) {
@@ -523,8 +599,9 @@ int kick_clients(struct dawn_mac bssid_mac, uint32_t id) {
            
             if ((kick_type == 0) && own_probe && (dawn_metric.kicking & 2) == 2) {
                 int band = get_band(own_probe->freq);
+                int own_signal = probe_effective_signal(own_probe);
 
-                if (own_probe->signal < dawn_metric.rssi_center[band])
+                if (own_signal != 0 && own_signal < dawn_metric.rssi_center[band])
                 {
                     dawnlog_info("Client " MACSTR ": Low asolute RSSI - proposing other APs\n", MAC2STR(j->client_addr.u8));
                     dawn_mutex_require(&ap_array_mutex);

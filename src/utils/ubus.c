@@ -629,8 +629,8 @@ static int handle_beacon_rep(struct blob_attr *msg) {
             // These fields, can't be set from a BEACON REPORT, so we ignore them later if updating an existing PROBE
             // TODO: See if hostapd can send optional elements which might allow these to be set
             entry->signal = 0;
-            entry->ht_capabilities = false; // that is very problematic!!!
-            entry->vht_capabilities = false; // that is very problematic!!!
+            entry->ht_capabilities = false;
+            entry->vht_capabilities = false;
 
             // FIXME: Why is this?  To allow a 802.11k client to meet proe count check immediately?
             entry->counter = dawn_metric.min_probe_count;
@@ -641,14 +641,19 @@ static int handle_beacon_rep(struct blob_attr *msg) {
             dawn_mutex_require(&probe_array_mutex);
             probe_entry* entry_updated = insert_to_probe_array(entry, true, true, time(0));
 
+            int rcpi_dbm = rcpi_to_rssi(entry->rcpi);
             if (entry_updated != entry)
             {
-                dawnlog_info("Local BEACON used to update RCPI and RSNI for client / BSSID = " MACSTR " / " MACSTR " \n", MAC2STR(entry->client_addr.u8), MAC2STR(entry->bssid_addr.u8));
+                dawnlog_info("BEACON report (update) client=" MACSTR " bssid=" MACSTR " rcpi=%u (~%d dBm) rsni=%u\n",
+                             MAC2STR(entry->client_addr.u8), MAC2STR(entry->bssid_addr.u8),
+                             entry->rcpi, rcpi_dbm, entry->rsni);
                 dawn_free(entry);
             }
             else
             {
-                dawnlog_info("Local BEACON is for new client / BSSID = " MACSTR " / " MACSTR " \n", MAC2STR(entry->client_addr.u8), MAC2STR(entry->bssid_addr.u8));
+                dawnlog_info("BEACON report (new) client=" MACSTR " bssid=" MACSTR " rcpi=%u (~%d dBm) rsni=%u\n",
+                             MAC2STR(entry->client_addr.u8), MAC2STR(entry->bssid_addr.u8),
+                             entry->rcpi, rcpi_dbm, entry->rsni);
 
                 dawn_mutex_require(&probe_array_mutex);
             }
@@ -1347,7 +1352,7 @@ static void ubus_umdns_cb(struct ubus_request *req, int type, struct blob_attr *
     if (!msg)
         return;
 
-    blobmsg_parse(dawn_umdns_table_policy, __DAWN_UMDNS_MAX, tb, blob_data(msg), blob_len(msg));
+    blobmsg_parse(dawn_umdns_table_policy, __DAWN_UMDNS_TABLE_MAX, tb, blob_data(msg), blob_len(msg));
 
     if (!tb[DAWN_UMDNS_TABLE]) {
         return;
@@ -1366,12 +1371,14 @@ static void ubus_umdns_cb(struct ubus_request *req, int type, struct blob_attr *
         struct blob_attr *tb_dawn[__DAWN_UMDNS_MAX];
         blobmsg_parse(dawn_umdns_policy, __DAWN_UMDNS_MAX, tb_dawn, blobmsg_data(attr), blobmsg_len(attr));
 
-        if (tb_dawn[DAWN_UMDNS_IPV4] && tb_dawn[DAWN_UMDNS_PORT]) {
-            dawnlog_debug("IPV4: %s\n", blobmsg_get_string(tb_dawn[DAWN_UMDNS_IPV4]));
-            dawnlog_debug("Port: %d\n", blobmsg_get_u32(tb_dawn[DAWN_UMDNS_PORT]));
-        } else {
-            return; // TODO: We're in a loop. Should this be return or continue?
+        if (!tb_dawn[DAWN_UMDNS_IPV4] || !tb_dawn[DAWN_UMDNS_PORT]) {
+            dawnlog_warning("umdns: peer entry missing ipv4 or port, skipping\n");
+            continue;
         }
+
+        dawnlog_debug("IPV4: %s\n", blobmsg_get_string(tb_dawn[DAWN_UMDNS_IPV4]));
+        dawnlog_debug("Port: %d\n", blobmsg_get_u32(tb_dawn[DAWN_UMDNS_PORT]));
+
         add_tcp_connection(blobmsg_get_string(tb_dawn[DAWN_UMDNS_IPV4]), blobmsg_get_u32(tb_dawn[DAWN_UMDNS_PORT]));
     }
 }
@@ -1902,6 +1909,7 @@ int uci_send_via_network()
         blobmsg_add_u32(&b, "max_chan_util_val", dawn_metric.max_chan_util_val[band]);
         blobmsg_add_u32(&b, "rssi_weight", dawn_metric.rssi_weight[band]);
         blobmsg_add_u32(&b, "rssi_center", dawn_metric.rssi_center[band]);
+        blobmsg_add_u32(&b, "beacon_request_rssi_max", dawn_metric.beacon_request_rssi_max[band]);
         blobmsg_close_table(&b, band_entry);
     }
     blobmsg_close_table(&b, band_table);

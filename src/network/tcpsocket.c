@@ -20,6 +20,91 @@
 LIST_HEAD(tcp_sock_list);
 LIST_HEAD(cli_list);
 
+struct peer_history_s {
+    struct list_head list;
+    struct sockaddr_in addr;
+    time_t last_connected;
+    time_t last_disconnected;
+    unsigned int connect_count;
+    unsigned int disconnect_count;
+    int last_state_connected;
+};
+
+static LIST_HEAD(peer_history_list);
+
+static struct peer_history_s *peer_history_lookup(const struct sockaddr_in *a) {
+    struct peer_history_s *p;
+    list_for_each_entry(p, &peer_history_list, list) {
+        if (p->addr.sin_addr.s_addr == a->sin_addr.s_addr &&
+            p->addr.sin_port == a->sin_port)
+            return p;
+    }
+    return NULL;
+}
+
+static struct peer_history_s *peer_history_get(const struct sockaddr_in *a) {
+    struct peer_history_s *p = peer_history_lookup(a);
+    if (p)
+        return p;
+    p = dawn_calloc(1, sizeof(*p));
+    if (!p)
+        return NULL;
+    p->addr = *a;
+    list_add(&p->list, &peer_history_list);
+    return p;
+}
+
+static void peer_log_connected(const struct sockaddr_in *a) {
+    struct peer_history_s *p = peer_history_get(a);
+    time_t now = time(0);
+    char ip[INET_ADDRSTRLEN];
+    inet_ntop(AF_INET, &a->sin_addr, ip, sizeof(ip));
+
+    if (p && p->last_state_connected == -1 && p->last_disconnected > 0) {
+        dawnlog_info("peer %s:%u reconnected after %lds (connects=%u)\n",
+                     ip, ntohs(a->sin_port),
+                     (long)(now - p->last_disconnected), p->connect_count + 1);
+    } else {
+        dawnlog_info("peer %s:%u connected\n", ip, ntohs(a->sin_port));
+    }
+    if (p) {
+        p->last_connected = now;
+        p->last_state_connected = 1;
+        p->connect_count++;
+    }
+}
+
+static void peer_log_connect_failed(const struct sockaddr_in *a, const char *reason) {
+    struct peer_history_s *p = peer_history_get(a);
+    char ip[INET_ADDRSTRLEN];
+    inet_ntop(AF_INET, &a->sin_addr, ip, sizeof(ip));
+
+    dawnlog_warning("peer %s:%u connect failed: %s\n", ip, ntohs(a->sin_port), reason);
+    if (p) {
+        p->last_disconnected = time(0);
+        p->last_state_connected = -1;
+    }
+}
+
+static void peer_log_disconnected(const struct sockaddr_in *a, const char *reason) {
+    struct peer_history_s *p = peer_history_lookup(a);
+    time_t now = time(0);
+    long uptime = (p && p->last_connected > 0) ? (long)(now - p->last_connected) : -1;
+    char ip[INET_ADDRSTRLEN];
+    inet_ntop(AF_INET, &a->sin_addr, ip, sizeof(ip));
+
+    dawnlog_warning("peer %s:%u disconnected: %s (uptime=%lds, disconnects=%u)\n",
+                    ip, ntohs(a->sin_port), reason, uptime,
+                    p ? p->disconnect_count + 1 : 1);
+    if (!p)
+        p = peer_history_get(a);
+    if (p) {
+        p->last_disconnected = now;
+        p->last_state_connected = -1;
+        p->disconnect_count++;
+    }
+}
+
 struct network_con_s *tcp_list_contains_address(struct sockaddr_in entry);
 
 static struct uloop_fd server;
@@ -50,8 +135,10 @@ static void client_close(struct ustream *s) {
     dawnlog_debug_func("Entering...");
 
     struct client *cl = container_of(s, struct client, s.stream);
+    char ip[INET_ADDRSTRLEN];
 
-    dawnlog_warning("Connection closed\n");
+    inet_ntop(AF_INET, &cl->sin.sin_addr, ip, sizeof(ip));
+    dawnlog_info("inbound peer %s:%u closed\n", ip, ntohs(cl->sin.sin_port));
     ustream_free(s);
     dawn_unregmem(s);
     close(cl->s.fd.fd);
@@ -73,16 +160,21 @@ static void client_notify_state(struct ustream *s) {
     if (!s->write_error && !s->eof)
         return;
 
-    dawnlog_error("Closing client-connection, pending: %d, total: %d\n", s->w.data_bytes, cl->ctr);
+    char ip[INET_ADDRSTRLEN];
+    inet_ntop(AF_INET, &cl->sin.sin_addr, ip, sizeof(ip));
+    dawnlog_warning("inbound peer %s:%u closing: %s (pending: %d)\n",
+                    ip, ntohs(cl->sin.sin_port),
+                    s->write_error ? "write_error" : "eof",
+                    s->w.data_bytes);
     client_close(s);
 }
 
-static void client_to_server_close(struct ustream *s) {
+static void client_to_server_close(struct ustream *s, const char *reason) {
     struct network_con_s *con = container_of(s, struct network_con_s, stream.stream);
 
     dawnlog_debug_func("Entering...");
 
-    dawnlog_warning("Connection to server closed\n");
+    peer_log_disconnected(&con->sock_addr, reason);
     ustream_free(s);
     dawn_unregmem(s);
 
@@ -93,15 +185,12 @@ static void client_to_server_close(struct ustream *s) {
 }
 
 static void client_to_server_state(struct ustream *s) {
-    struct client *cl = container_of(s, struct client, s.stream);
-
     dawnlog_debug_func("Entering...");
 
     if (!s->write_error && !s->eof)
         return;
 
-    dawnlog_error("Closing connection, pending: %d, total: %d\n", s->w.data_bytes, cl->ctr);
-    client_to_server_close(s);
+    client_to_server_close(s, s->write_error ? "write_error" : "eof");
 }
 
 static void client_read_cb(struct ustream *s, int bytes) {
@@ -244,7 +333,11 @@ static void server_cb(struct uloop_fd *fd, unsigned int events) {
     ustream_fd_init(&cl->s, sfd);
     dawn_regmem(&cl->s);
     next_client = NULL;  // TODO: Why is this here?  To avoid resetting if above return happens?
-    dawnlog_info("New connection\n");
+    {
+        char ip[INET_ADDRSTRLEN];
+        inet_ntop(AF_INET, &cl->sin.sin_addr, ip, sizeof(ip));
+        dawnlog_info("inbound peer %s:%u accepted\n", ip, ntohs(cl->sin.sin_port));
+    }
 }
 
 int run_server(char *ipv4, int port) {
@@ -293,6 +386,7 @@ static void client_ping_read_cb(struct ustream *s, int bytes) {
             dawnlog_error("Ustream error(" STR_QUOTE(__LINE__) ")!\n");
             //ERROR HANDLING!
             if (con->stream.stream.write_error) {
+                peer_log_disconnected(&con->sock_addr, "write_error_pong");
                 ustream_free(&con->stream.stream);
                 dawn_unregmem(&con->stream.stream);
                 close(con->fd.fd);
@@ -316,7 +410,7 @@ static void connect_cb(struct uloop_fd *f, unsigned int events) {
     dawnlog_debug_func("Entering...");
 
     if (f->eof || f->error) {
-        dawnlog_error("Connection failed (%s)\n", f->eof ? "EOF" : "ERROR");
+        peer_log_connect_failed(&entry->sock_addr, f->eof ? "EOF" : "ERROR");
         close(entry->fd.fd);
         list_del(&entry->list);
         dawn_free(entry);
@@ -324,7 +418,6 @@ static void connect_cb(struct uloop_fd *f, unsigned int events) {
         return;
     }
 
-    dawnlog_debug("Connection established\n");
     uloop_fd_delete(&entry->fd);
 
     entry->stream.stream.notify_read = client_ping_read_cb;
@@ -334,6 +427,7 @@ static void connect_cb(struct uloop_fd *f, unsigned int events) {
     dawn_regmem(&entry->stream);
 
     entry->connected = 1;
+    peer_log_connected(&entry->sock_addr);
 }
 
 int add_tcp_connection(char *ipv4, int port) {
@@ -341,13 +435,24 @@ int add_tcp_connection(char *ipv4, int port) {
 
     dawnlog_debug_func("Entering...");
 
+    if (ipv4 == NULL || port <= 0 || port > 65535) {
+        dawnlog_warning("add_tcp_connection: invalid peer %s:%d, skipping\n",
+                        ipv4 ? ipv4 : "(null)", port);
+        return -1;
+    }
+
     char port_str[12];
-    sprintf(port_str, "%d", port); // TODO: Manage buffer length
+    snprintf(port_str, sizeof(port_str), "%d", port);
 
     memset(&serv_addr, 0, sizeof(serv_addr));
     serv_addr.sin_family = AF_INET;
     serv_addr.sin_addr.s_addr = inet_addr(ipv4);
     serv_addr.sin_port = htons(port);
+
+    if (serv_addr.sin_addr.s_addr == INADDR_NONE) {
+        dawnlog_warning("add_tcp_connection: invalid ipv4 '%s', skipping\n", ipv4);
+        return -1;
+    }
 
     struct network_con_s *tmp = tcp_list_contains_address(serv_addr);
     if (tmp != NULL) {
@@ -368,6 +473,7 @@ int add_tcp_connection(char *ipv4, int port) {
     tcp_entry->sock_addr = serv_addr;
 
     if (tcp_entry->fd.fd < 0) {
+        peer_log_connect_failed(&serv_addr, "usock_failed");
         dawn_free(tcp_entry);
         tcp_entry = NULL;
         return -1;
@@ -418,6 +524,7 @@ void send_tcp(char *msg) {
                     dawnlog_error("Ustream error(" STR_QUOTE(__LINE__) ")!\n");
                     //ERROR HANDLING!
                     if (con->stream.stream.write_error) {
+                        peer_log_disconnected(&con->sock_addr, "write_error_send");
                         ustream_free(&con->stream.stream);
                         dawn_unregmem(&con->stream.stream);
                         close(con->fd.fd);
@@ -455,6 +562,7 @@ void send_tcp(char *msg) {
                     //ERROR HANDLING!
                     dawnlog_error("Ustream error(" STR_QUOTE(__LINE__) ")!\n");
                     if (con->stream.stream.write_error) {
+                        peer_log_disconnected(&con->sock_addr, "write_error_send");
                         ustream_free(&con->stream.stream);
                         dawn_unregmem(&con->stream.stream);
                         close(con->fd.fd);
@@ -500,7 +608,10 @@ void check_timeout(int timeout) {
         list_for_each_entry_safe(cl, tmp, &cli_list, list)
         {
             if (now - cl->time_alive > timeout || now - cl->time_alive < -timeout) {
-                dawnlog_info("Client: close client connection! timeout=%d\n", (int)(now - cl->time_alive));
+                char ip[INET_ADDRSTRLEN];
+                inet_ntop(AF_INET, &cl->sin.sin_addr, ip, sizeof(ip));
+                dawnlog_warning("inbound peer %s:%u timeout=%ds, closing\n",
+                                ip, ntohs(cl->sin.sin_port), (int)(now - cl->time_alive));
                 client_close(&cl->s.stream);
             }
         }
@@ -512,7 +623,7 @@ void check_timeout(int timeout) {
         list_for_each_entry_safe(con, tmp, &tcp_sock_list, list)
         {
             if (now - con->time_alive > timeout || now - con->time_alive < -timeout) {
-                dawnlog_info("Server: close client_to_server connection! timeout=%d\n", (int)(now - con->time_alive));
+                peer_log_disconnected(&con->sock_addr, "timeout");
                 ustream_free(&con->stream.stream);
                 dawn_unregmem(&con->stream.stream);
                 close(con->fd.fd);
@@ -530,7 +641,8 @@ struct network_con_s* tcp_list_contains_address(struct sockaddr_in entry) {
 
     list_for_each_entry(con, &tcp_sock_list, list)
     {
-        if(entry.sin_addr.s_addr == con->sock_addr.sin_addr.s_addr)
+        if (entry.sin_addr.s_addr == con->sock_addr.sin_addr.s_addr &&
+            entry.sin_port == con->sock_addr.sin_port)
         {
             return con;
         }

@@ -312,6 +312,8 @@ struct probe_metric_s uci_get_dawn_metric() {
         .rssi_center = { -70, -70 },
         // CONFIG-B: rssi_weight|Per dB increment for weighted RSSI evaluation|[0] See note 2.
         .rssi_weight = { 0, 0 },
+        // CONFIG-B: beacon_request_rssi_max|Skip soliciting 802.11k BEACON reports from clients whose current RSSI is at or above this value|[0 = always solicit] See note 2.
+        .beacon_request_rssi_max = { 0, 0 },
         .neighbors = {NULL, NULL},
     };
     struct uci_section *global_s, *band_s[__DAWN_BAND_MAX];
@@ -374,6 +376,7 @@ struct probe_metric_s uci_get_dawn_metric() {
     DAWN_SET_BANDS_CONFIG_INT(ret, global_s, band_s, low_rssi_val);
     DAWN_SET_BANDS_CONFIG_INT(ret, global_s, band_s, rssi_weight);
     DAWN_SET_BANDS_CONFIG_INT(ret, global_s, band_s, rssi_center);
+    DAWN_SET_BANDS_CONFIG_INT(ret, global_s, band_s, beacon_request_rssi_max);
     return ret;
 }
 

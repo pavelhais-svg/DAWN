@@ -160,6 +160,12 @@ probe_entry *parse_to_probe_req(struct blob_attr* msg) {
 
     blobmsg_parse(prob_policy, __PROB_MAX, tb, blob_data(msg), blob_len(msg));
 
+    if (!tb[PROB_BSSID_ADDR] || !tb[PROB_CLIENT_ADDR] || !tb[PROB_TARGET_ADDR]) {
+        dawnlog_warning("probe msg missing bssid/address/target\n");
+        dawn_free(prob_req);
+        return NULL;
+    }
+
     if (hwaddr_aton(blobmsg_data(tb[PROB_BSSID_ADDR]), prob_req->bssid_addr.u8))
     {
         dawn_free(prob_req);
@@ -377,10 +383,10 @@ dump_client(struct blob_attr** tb, struct dawn_mac client_addr, const char* bssi
     uint8_t vht_supported) {
     dawnlog_debug_func("Entering...");
 
-    client *client_entry = dawn_malloc(sizeof(struct client_s));
+    client *client_entry = dawn_calloc(1, sizeof(struct client_s));
     if (client_entry == NULL)
     {
-        // MUSTDO: Error handling?
+        dawnlog_error("dawn_calloc of client_entry failed\n");
         return;
     }
 
@@ -499,13 +505,20 @@ int parse_to_clients(struct blob_attr* msg) {
 
     // Get clients
     if (tb[CLIENT_TABLE] && tb[CLIENT_TABLE_BSSID] && tb[CLIENT_TABLE_FREQ]) {
+        uint8_t ht_supported = tb[CLIENT_TABLE_HT] ? blobmsg_get_u8(tb[CLIENT_TABLE_HT]) : 0;
+        uint8_t vht_supported = tb[CLIENT_TABLE_VHT] ? blobmsg_get_u8(tb[CLIENT_TABLE_VHT]) : 0;
+
         int num_stations = 0;
         num_stations = dump_client_table(blobmsg_data(tb[CLIENT_TABLE]), blobmsg_data_len(tb[CLIENT_TABLE]),
             blobmsg_data(tb[CLIENT_TABLE_BSSID]), blobmsg_get_u32(tb[CLIENT_TABLE_FREQ]),
-            blobmsg_get_u8(tb[CLIENT_TABLE_HT]), blobmsg_get_u8(tb[CLIENT_TABLE_VHT]));
+            ht_supported, vht_supported);
 
         // Get AP
-        ap *ap_entry = dawn_malloc(sizeof(struct ap_s));
+        ap *ap_entry = dawn_calloc(1, sizeof(struct ap_s));
+        if (ap_entry == NULL) {
+            dawnlog_error("dawn_calloc of ap_entry failed\n");
+            return -1;
+        }
         hwaddr_aton(blobmsg_data(tb[CLIENT_TABLE_BSSID]), ap_entry->bssid_addr.u8);
         ap_entry->freq = blobmsg_get_u32(tb[CLIENT_TABLE_FREQ]);
 
@@ -533,7 +546,8 @@ int parse_to_clients(struct blob_attr* msg) {
         }
 
         if (tb[CLIENT_TABLE_SSID]) {
-            strcpy((char*)ap_entry->ssid, blobmsg_get_string(tb[CLIENT_TABLE_SSID]));
+            strncpy((char*)ap_entry->ssid, blobmsg_get_string(tb[CLIENT_TABLE_SSID]), SSID_MAX_LEN);
+            ap_entry->ssid[SSID_MAX_LEN] = '\0';
         }
 #if 0 // Pending deletion if no longer required
         if (tb[CLIENT_TABLE_COL_DOMAIN]) {
@@ -578,14 +592,16 @@ int parse_to_clients(struct blob_attr* msg) {
         }
 
         if (tb[CLIENT_TABLE_IFACE]) {
-            strncpy(ap_entry->iface, blobmsg_get_string(tb[CLIENT_TABLE_IFACE]), MAX_INTERFACE_NAME);
+            strncpy(ap_entry->iface, blobmsg_get_string(tb[CLIENT_TABLE_IFACE]), MAX_INTERFACE_NAME - 1);
+            ap_entry->iface[MAX_INTERFACE_NAME - 1] = '\0';
         }
         else {
             ap_entry->iface[0] = '\0';
         }
 
         if (tb[CLIENT_TABLE_HOSTNAME]) {
-            strncpy(ap_entry->hostname, blobmsg_get_string(tb[CLIENT_TABLE_HOSTNAME]), HOST_NAME_MAX);
+            strncpy(ap_entry->hostname, blobmsg_get_string(tb[CLIENT_TABLE_HOSTNAME]), HOST_NAME_MAX - 1);
+            ap_entry->hostname[HOST_NAME_MAX - 1] = '\0';
         }
         else {
             ap_entry->hostname[0] = '\0';
